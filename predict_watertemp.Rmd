@@ -1,0 +1,123 @@
+---
+title: "Predicting water temperature using air temperature and elevation"
+output: html_document
+date: "2025-07-10"
+---
+
+This is an adapted and simplified version of code used to execute models to predict water temperature using daily air temperature and elevation. We can use this code to create our predictors, train our model on available water temperature data and infill gaps in an existing gauge. 
+
+Please see accompanying manuscript for full details on model training and validation. 
+
+We train the models on water temperature data we have access to. This requires the user to download the following for their area of interest:
+- daily water temperature observations (this will have to be adjusted depending on your local agencies)
+- daily air temperature observations. We downloaded this using Mcera5
+- site ID (an assigned ID for each unique gauge)
+- region ID (we use catchment are)
+
+We also require some additional predictors that you can use the code below to create. 
+- elevation (in metres) we use the package elevatr to retreive this data according to GPS coordiates and then scale these across sites. This is then scaled in relation to other sites. 
+- scaled rolling air temperature of the last 7 days. 
+
+We have included a large csv file of cleaned environmental data of gauges within Victoria, Australia. This is complete with site ID and region ID, daily water temperature observations for training sites, daily air temperature observations for training sites and longitude and latitude. We also include a csv for a gauge to simulate filling gaps (gauge_405294.csv)
+
+#(0) Setup and loading data
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(broom.mixed)
+
+wd = "D:/OneDrive - The University of Melbourne/trout-project/01_watertemp/code/github/"
+
+setwd(wd)
+
+#loading evironmental data that includes water temperature estimates
+enviroDataDemo <- readr::read_csv("enviroDataDemo.csv") #this also includes gauge 405294 which we use to later infill
+
+training.data <- enviroDataDemo %>% filter(station != "405294") #excluding this for this demonstrative exercise of infilling naively to gauge 405294
+training.data$date_aest <- as.Date(training.data$date_aest)
+colnames(training.data)
+
+#loading environmental data for gauge 405294 where we simulate that there are no water temperature estimates
+gap.data <- readr::read_csv("gauge_405294.csv") #loading our dummy gauge with no water temperature, just station, region, longittude, latitude, date and air temp
+gap.data$date_aest <- as.Date(gap.data$date_aest)
+colnames(gap.data)
+     
+```
+
+#(1) Preparing predictors (elevation and rolling air temperature)
+
+Because elevation and rolling air temperature are scaled, we should make sure our site which has no water temperature data is included in this scaling process. 
+
+```{r}
+#####grabbing unique stations and their GPS coordinates#####
+all.data <- bind_rows(training.data, gap.data) #for scaling purposes
+
+site_details <- all.data %>% 
+                select(station, LONGITUDE, LATITUDE) %>%
+                unique() 
+
+#####using elevatr package to download elevation#####
+library(elevatr)
+site_details.sf <- sf::st_as_sf(site_details, coords = c("LONGITUDE", "LATITUDE"),crs = 4326)
+elevation.df<- get_elev_point(site_details.sf, prj = 4326, src = "aws" ) #downloading elevtion in metres
+elevation.df <- sf::st_drop_geometry(elevation.df) #getting rid of geometry
+elevation.df <- elevation.df %>% select(station, elevation)
+elevation.df <- as.data.frame(elevation.df)  
+elevation.df$ELEVScaled <- scale(elevation.df$elevation) #scaling elevation
+
+#append this back to our training dataframe
+training.data <-merge(training.data, elevation.df, by = "station" )
+training.data$ELEVScaled <- as.numeric(training.data$ELEVScaled)
+
+#append this back to our site where we need infilling
+gap.data <-merge(gap.data, elevation.df, by = "station" )
+gap.data$ELEVScaled <- as.numeric(gap.data$ELEVScaled)
+
+##### calculating rolling mean for the last 7 days ######
+air_predictors<- all.data %>% 
+  select(date_aest, station, meanDailyAir) %>%
+  mutate(date_aest = as.Date(date_aest, "%Y-%m-%d")) %>%
+  arrange(station, date_aest) %>%
+  group_by(station) %>%
+  mutate(rollAir_7 = zoo::rollmean(meanDailyAir, k=7, fill = NA, align = "right")) %>%
+  mutate(rollAir_7Scaled = scale(rollAir_7)) %>% 
+  select(-c(meanDailyAir))
+
+#merging these rolling air temps back to their respective dataframes
+training.data <- left_join(training.data, air_predictors, by = c("station", "date_aest"))
+#square root transforming y 
+training.data$sqrt_meanDailyTemp <- sqrt(training.data$meanDailyTemp) #final 692646 observations
+training.data <- drop_na(training.data) #model won't be able to use NA values for training so make sure this is good to go. You will have NAs based on just the nature of rolling averages so make sure you download enough data prior to your temporal extent.
+
+gap.data <- left_join(gap.data, air_predictors, by = c("station", "date_aest"))
+
+
+```
+
+
+#(2) Training AirElev1 model on our Victorian dataset
+
+```{r}
+library(lme4)
+
+#training model on data from our Victorian dataset
+bestAirElev1 <- lmer(sqrt_meanDailyTemp ~  ELEVScaled + rollAir_7Scaled + I(rollAir_7Scaled^2) + 
+    (1 | REGION/station) + ELEVScaled:rollAir_7Scaled, training.data, REML = T)
+```
+
+
+#(3) Using the model to infill data
+
+Here we use data from gauge 405294 as an example of how we can use this model to infill data. 
+
+```{r}
+
+#using the model to predict to new data
+predicted <- predict(bestAirElev1, newdata = gap.data, allow.new.levels = TRUE)
+predicted <- (predicted)^2 #to untransform the square root
+date <- as.Date(gap.data$date_aest)
+dfName <- paste0("predictions_",405294)
+assign(dfName, data.frame(date, predicted))
+
+```
+
